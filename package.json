@@ -1,0 +1,23 @@
+{
+  "name": "pi-checkpoint",
+  "version": "0.1.0",
+  "description": "Undo/redo for pi agent turns — checkpoints your working tree before each LLM turn via git worktree",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "checkpoint", "undo", "redo", "git-worktree"],
+  "license": "MIT",
+  "author": "Karl Robeck Alferez",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/karlrobeck/pi-checkpoint"
+  },
+  "pi": {
+    "extensions": ["./extensions/checkpoint.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
