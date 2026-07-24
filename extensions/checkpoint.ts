@@ -17,6 +17,12 @@ interface CheckpointData {
   prompt?: string;
   /** Whether this is a redo-point (created during /undo) */
   isRedoPoint?: boolean;
+  /**
+   * Session entry ID that was the leaf before this checkpoint's turn (preAgent),
+   * or the leaf before /undo was invoked (redoPoint).
+   * Used by navigateTree to rewind / restore session messages.
+   */
+  entryId?: string;
 }
 
 interface CheckpointState {
@@ -151,6 +157,10 @@ async function restoreSnapshot(
 
 /**
  * Rebuild checkpoint state by scanning session custom entries.
+ *
+ * Processes entries in chronological order and uses mutual exclusion:
+ * when a preAgent is found, any stale redoPoint is cleared, and vice versa.
+ * This ensures that the most recent checkpoint entry determines the valid action.
  */
 function rebuildState(entries: ReadonlyArray<{ type: string; customType?: string; data?: unknown }>): CheckpointState {
   const state: CheckpointState = { preAgent: null, redoPoint: null };
@@ -161,9 +171,13 @@ function rebuildState(entries: ReadonlyArray<{ type: string; customType?: string
     if (!data || !data.commitHash || !data.worktreePath) continue;
 
     if (data.isRedoPoint) {
+      // A redo-point means the preAgent was consumed by an /undo
       state.redoPoint = data;
+      state.preAgent = null;
     } else {
+      // A new preAgent checkpoint (from a fresh agent turn) invalidates any stale redo
       state.preAgent = data;
+      state.redoPoint = null;
     }
   }
 
@@ -211,14 +225,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     if (!gitRoot) return;
 
-    // Skip if there's an active undo/redo workflow that hasn't been resolved
-    if (state.redoPoint && !state.preAgent) {
-      // We've undone and haven't checkpointed again yet. Create a fresh checkpoint
-      // so the new turn can be undone independently.
-    }
-
     try {
+      // Capture the current leaf entry ID before the agent turn begins.
+      // This is the entry we'll navigate back to on /undo to remove the
+      // agent's messages from the active session.
+      const entryId = ctx.sessionManager.getLeafId() ?? undefined;
+
       const snapshot = await createSnapshot(gitRoot, pi, event.prompt);
+      snapshot.entryId = entryId;
 
       // Store in session
       pi.appendEntry("pi-checkpoint", snapshot);
@@ -243,7 +257,7 @@ export default function (pi: ExtensionAPI) {
   // ── /undo command ──
 
   pi.registerCommand("undo", {
-    description: "Undo file changes made by the last agent turn",
+    description: "Undo file changes and session messages from the last agent turn",
     handler: async (_args, ctx) => {
       if (!gitRoot) {
         ctx.ui.notify("pi-ckpt: not a git repo — can't undo", "error");
@@ -255,27 +269,57 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (!state.preAgent.entryId) {
+        ctx.ui.notify("pi-ckpt: missing session entry info — can't undo messages", "error");
+        return;
+      }
+
       try {
         // Step 1: Snapshot the current (agent-modified) state for redo
         ctx.ui.notify("pi-ckpt: creating redo-point...", "info");
         const redoSnapshot = await createSnapshot(gitRoot, pi);
         const redoData: CheckpointData = { ...redoSnapshot, isRedoPoint: true };
 
-        // Step 2: Restore the pre-agent snapshot
-        ctx.ui.notify("pi-ckpt: restoring pre-agent state...", "info");
+        // Step 2: Record the current leaf ID so redo can navigate forward
+        const currentLeafId = ctx.sessionManager.getLeafId();
+        if (currentLeafId) {
+          redoData.entryId = currentLeafId;
+        }
+
+        // Step 3: Navigate session tree back to before the agent turn.
+        // This removes the agent's messages (user prompt, assistant, tool results)
+        // from the active conversation by moving the leaf to the pre-agent entry.
+        ctx.ui.notify("pi-ckpt: reverting session messages...", "info");
+        const navResult = await ctx.navigateTree(state.preAgent.entryId, {
+          summarize: false,
+        });
+
+        if (navResult.cancelled) {
+          ctx.ui.notify("pi-ckpt: undo cancelled (navigation blocked)", "warning");
+          return;
+        }
+
+        // Restore the editor text to the prompt that was undone,
+        // so the user can re-edit it (e.g. fix a typo)
+        if (state.preAgent.prompt) {
+          ctx.ui.setEditorText(state.preAgent.prompt);
+        }
+
+        // Step 4: Restore the pre-agent file snapshot
+        ctx.ui.notify("pi-ckpt: restoring pre-agent file state...", "info");
         await restoreSnapshot(gitRoot, state.preAgent, pi);
 
-        // Step 3: Update state
+        // Step 5: Update state
         state.redoPoint = redoData;
         state.preAgent = null; // Can't undo again since we consumed it
 
-        // Step 4: Persist redo-point in session
+        // Step 6: Persist redo-point in session
         pi.appendEntry("pi-checkpoint", redoData);
 
-        // Step 5: Clear status
+        // Step 7: Clear status
         ctx.ui.setStatus("pi-ckpt", undefined);
 
-        ctx.ui.notify("pi-ckpt: undone — files restored to pre-agent state", "info");
+        ctx.ui.notify("pi-ckpt: undone — messages and files restored to pre-agent state", "info");
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`pi-ckpt: undo failed — ${msg}`, "error");
@@ -286,7 +330,7 @@ export default function (pi: ExtensionAPI) {
   // ── /redo command ──
 
   pi.registerCommand("redo", {
-    description: "Redo the last undone agent turn's file changes",
+    description: "Redo the last undone agent turn's file changes and session messages",
     handler: async (_args, ctx) => {
       if (!gitRoot) {
         ctx.ui.notify("pi-ckpt: not a git repo — can't redo", "error");
@@ -298,15 +342,31 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (!state.redoPoint.entryId) {
+        ctx.ui.notify("pi-ckpt: missing session entry info — can't redo messages", "error");
+        return;
+      }
+
       try {
-        // Restore the redo-point snapshot
-        ctx.ui.notify("pi-ckpt: restoring agent changes...", "info");
+        // Step 1: Navigate session tree forward to restore the undone messages
+        ctx.ui.notify("pi-ckpt: restoring session messages...", "info");
+        const navResult = await ctx.navigateTree(state.redoPoint.entryId, {
+          summarize: false,
+        });
+
+        if (navResult.cancelled) {
+          ctx.ui.notify("pi-ckpt: redo cancelled (navigation blocked)", "warning");
+          return;
+        }
+
+        // Step 2: Restore the redo-point file snapshot
+        ctx.ui.notify("pi-ckpt: restoring agent file changes...", "info");
         await restoreSnapshot(gitRoot, state.redoPoint, pi);
 
-        // Clear redo state (single-level)
+        // Step 3: Clear redo state (single-level)
         state.redoPoint = null;
 
-        ctx.ui.notify("pi-ckpt: redone — agent changes restored", "info");
+        ctx.ui.notify("pi-ckpt: redone — messages and files restored", "info");
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`pi-ckpt: redo failed — ${msg}`, "error");
